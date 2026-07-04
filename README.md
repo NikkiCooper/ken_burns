@@ -557,3 +557,9 @@ ken_burns/
 ```
 
 Images can be JPG, JPEG, or PNG. Files are sorted alphabetically within `--img_path` to determine slide order. Name them numerically (`001.jpg`, `002.jpg`, …) to control sequence.
+
+---
+
+## License
+
+GNU Lesser General Public License v3.0 — see [LICENSE](LICENSE).
