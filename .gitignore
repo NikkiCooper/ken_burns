@@ -1,0 +1,10 @@
+# .gitignore file
+__pycache__/
+.idea/
+.scratch
+.vscode
+.claude
+*~
+OLD_IGNORE/
+
+
