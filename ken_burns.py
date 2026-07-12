@@ -16,6 +16,7 @@ import subprocess
 from cliOpts import cliOpts
 from Bcolors import Bcolors
 
+# In my workflow implementation, we are down-scaling the images from 3840x2160 to a target resolution of 1920x1080 pixels.
 TARGET_W = 1920
 TARGET_H = 1080
 
@@ -41,6 +42,12 @@ SHARPEN_PRESETS = {
 # ---------------------------------------------------------------------------
 
 def print_filter_help():
+    """
+    Prints help information for the image filters.
+
+    :return: None
+    :rtype: None
+    """
     bc = Bcolors()
     sep  = f"{bc.BOLD + bc.Dark_Gray_f}{'─' * 68}{bc.ENDC}"
     sep2 = f"{bc.Dark_Gray_f}{'╌' * 68}{bc.ENDC}"
@@ -124,7 +131,7 @@ def print_filter_help():
     para("A CUDA Laplacian edge boost. Converts the image to greyscale, "
          "applies a 3×3 Laplacian kernel to extract edge detail, then blends "
          "the absolute edge map back onto the original BGR image. The result "
-         "is increased perceived sharpness without altering colour.")
+         "is increased perceived sharpness without altering color.")
     print()
 
     sub("Presets")
@@ -203,6 +210,12 @@ def print_filter_help():
 
 
 def print_fmap_help():
+    """
+    Prints help information for the filter map.
+
+    :return: None
+    :rtype: None
+    """
     bc = Bcolors()
     sep  = f"{bc.BOLD + bc.Dark_Gray_f}{'─' * 68}{bc.ENDC}"
     sep2 = f"{bc.Dark_Gray_f}{'╌' * 68}{bc.ENDC}"
@@ -549,6 +562,14 @@ def get_gpu_frame(params, frame_idx, hold_frames, gpu_scratch,
 # ---------------------------------------------------------------------------
 
 def collect_images(img_path):
+    """
+    Collects image files from a given directory path.
+
+    :param img_path: The directory path to search for image files.
+    :type img_path: str
+    :return: A list of image file paths.
+    :rtype: list[str]
+    """
     extensions = ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG')
     files = []
     for ext in extensions:
@@ -564,7 +585,7 @@ def collect_images(img_path):
 def _staircase_score(gray):
     """
     Edge-direction discontinuity score for a greyscale thumbnail (numpy uint8).
-    Higher = more staircase-like zigzag on edges.
+    Higher = more staircase-like zigzag on edges.  HIGHLY EXPERIMENTAL. Mostly broken.
     """
     edges = cv2.Canny(gray, 50, 150)
     if not edges.any():
@@ -599,6 +620,24 @@ def _staircase_score(gray):
 
 
 def _score_to_preset(score, threshold):
+    """
+    Calculate the preset category based on the difference between the score and the threshold.
+
+    This function evaluates the difference between a given score and a threshold, categorizing
+    it into one of four preset levels: 'subtle', 'light', 'medium', or 'strong'. The preset
+    level is determined by defined ranges of the difference (delta). This function is intended
+    for internal calculations and determines preset values dynamically.
+
+    HIGHLY EXPERIMENTAL. Mostly broken.
+
+    :param score: The input score value to evaluate.
+    :type score: float
+    :param threshold: The threshold value against which the score is compared.
+    :type threshold: float
+    :return: A string indicating the preset category. Possible values are 'subtle', 'light',
+        'medium', or 'strong'.
+    :rtype: str
+    """
     delta = score - threshold
     if delta <= 15:
         return 'subtle'
@@ -611,6 +650,24 @@ def _score_to_preset(score, threshold):
 
 
 def generate_filter_map(img_path, threshold, smooth=None, sharpen=None):
+    """
+    Generates a filter map for a collection of images by calculating a score for
+    each image, based on their stair-casing effect. Images that exceed a given
+    threshold are flagged, and optional smoothing or sharpening presets can be
+    applied for flagged images. The results are exported as a JSON filter map.
+
+    HIGHLY EXPERIMENTAL
+
+    :param img_path: Path to the directory containing the images.
+    :type img_path: str
+    :param threshold: The minimum score required to flag an image.
+    :type threshold: float
+    :param smooth: Optional smoothing preset to apply for flagged images.
+    :type smooth: int, optional
+    :param sharpen: Optional sharpening preset to apply for flagged images.
+    :type sharpen: int, optional
+    :return: None
+    """
     bc = Bcolors()
     image_files = collect_images(img_path)
     N = len(image_files)
@@ -742,7 +799,7 @@ def render_video(image_files, output_path, duration_sec, fps, trans_time_sec,
                  ken_burns=False, base_zoom_in=False,
                  metadata_comment=None, target_w=TARGET_W, target_h=TARGET_H):
     """
-    Direct GPU-accelerated pipeline.
+    Direct GPU-accelerated pipeline. (mostly)
 
     Transition types (per boundary): 'crossfade' | 'ftb'
     Zoom modes:
@@ -791,6 +848,9 @@ def render_video(image_files, output_path, duration_sec, fps, trans_time_sec,
     slide_cache = {}
 
     def load_slide(idx):
+        """
+        Load a slide from the cache or from disk, applying necessary transformations.
+        """
         if idx in slide_cache:
             return slide_cache[idx]
         img = cv2.imread(image_files[idx])
@@ -898,6 +958,29 @@ def render_video(image_files, output_path, duration_sec, fps, trans_time_sec,
 # ---------------------------------------------------------------------------
 
 def calculate_report(opts, img_path):
+    """
+    Calculates and prints a report for slide show duration settings and configuration.
+
+    This function generates detailed statistics and formatted output for slide show
+    durations based on input options and a list of images. It calculates values such
+    as total duration, duration per transition type, visible hold time per slide, and
+    provides configuration details like zoom and transition modes.
+
+    The output is formatted for readability and includes warnings if configuration
+    parameters are inconsistent or incompatible.
+
+    :param opts: An object containing configuration options such as duration,
+        transition time, frames per second (FPS), and additional effects like
+        ken burns or drift.
+    :type opts: Any
+    :param img_path: The path to the directory containing the image files to
+        include in the slide show.
+    :type img_path: str
+
+    :return: None. This function directly prints the calculated statistics and
+             formatted report to the console.
+    :rtype: None
+    """
     bc = Bcolors()
     image_files = collect_images(img_path)
     N = len(image_files)
