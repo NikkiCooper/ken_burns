@@ -430,14 +430,26 @@ def apply_bilateral_smooth(gpu_img, smooth, intensity_override=None):
 
 
 def apply_laplacian_boost(gpu_img, boost_strength):
-    """CUDA Laplacian edge boost. gpu_img must be a BGR GpuMat. Returns a GpuMat."""
+    """CUDA Laplacian edge boost.
+    Compatible with OpenCV 5.x. gpu_img must be a BGR GpuMat. Returns a GpuMat.
+    """
+    # 1. Color conversion signatures remain valid
     gpu_gray = cv2.cuda.cvtColor(gpu_img, cv2.COLOR_BGR2GRAY)
+
+    # 2. LaplacianFilter signature is unchanged in 5.x
     lap_filter = cv2.cuda.createLaplacianFilter(cv2.CV_8UC1, cv2.CV_8UC1, 3)
     gpu_lap = lap_filter.apply(gpu_gray)
-    gpu_lap_abs = cv2.cuda.abs(gpu_lap)
-    gpu_lap_bgr = cv2.cuda.cvtColor(gpu_lap_abs, cv2.COLOR_GRAY2BGR)
-    return cv2.cuda.addWeighted(gpu_img, 1.0, gpu_lap_bgr, boost_strength, 0.0)
 
+    # 3. CV_8UC1 output is already unsigned — absolute value is a no-op.
+    gpu_lap_abs = gpu_lap
+
+    # 4. Convert absolute laplacian back to BGR
+    gpu_lap_bgr = cv2.cuda.cvtColor(gpu_lap_abs, cv2.COLOR_GRAY2BGR)
+
+    # 5. Native blend via unified math wrappers
+    # Pass boost_strength explicitly as a float scalar
+    return cv2.cuda.addWeighted(gpu_img, 1.0, gpu_lap_bgr, float(boost_strength), 0.0)
+    #return cv2.addWeighted(gpu_img, 1.0, gpu_lap_bgr, float(boost_strength), 0.0)
 
 # ---------------------------------------------------------------------------
 # Easing helpers
@@ -459,13 +471,6 @@ def ease_out(t):
 
 def compute_slide_params(img, drift_value, direction, smooth=None, sharpen=None,
                          smooth_intensity=None, target_w=TARGET_W, target_h=TARGET_H):
-    """
-    Compute crop geometry for one slide and pre-process on GPU.
-
-    drift_value == 0.0: static hold — pre-resize once, store cpu_frame.
-    drift_value  > 0.0: Ken Burns / drift zoom — store raw image for per-frame crop.
-                        At drift_value=1.0 the crop change is ~15% (full Ken Burns).
-    """
     h, w = img.shape[:2]
     target_aspect = target_w / target_h
 
@@ -478,14 +483,15 @@ def compute_slide_params(img, drift_value, direction, smooth=None, sharpen=None,
     wide_y = (h - wide_h) // 2
 
     if drift_value == 0.0:
-        gpu = cv2.cuda_GpuMat()
+        gpu = cv2.cuda.GpuMat()  # ✓ FIXED (1 of 3)
         crop = img[wide_y:wide_y + wide_h, wide_x:wide_x + wide_w]
         gpu.upload(crop)
+        # ✓ FIXED INTERPOLATION NAMESPACE
         gpu_resized = cv2.cuda.resize(gpu, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
         if smooth:
             gpu_resized = apply_bilateral_smooth(gpu_resized, smooth, smooth_intensity)
         if sharpen:
-            gpu_resized = apply_laplacian_boost(gpu_resized, SHARPEN_PRESETS[sharpen])
+              gpu_resized = apply_laplacian_boost(gpu_resized, SHARPEN_PRESETS[sharpen])
         return {
             'drift': False,
             'smooth': smooth,
@@ -503,59 +509,69 @@ def compute_slide_params(img, drift_value, direction, smooth=None, sharpen=None,
 
     if direction:  # zoom in: wide → tight
         start = (wide_w, wide_h, wide_x, wide_y)
-        end   = (tight_w, tight_h, tight_x, tight_y)
-    else:          # zoom out: tight → wide
+        end = (tight_w, tight_h, tight_x, tight_y)
+    else:  # zoom out: tight → wide
         start = (tight_w, tight_h, tight_x, tight_y)
-        end   = (wide_w, wide_h, wide_x, wide_y)
+        end = (wide_w, wide_h, wide_x, wide_y)
+
+    # Upload the full image once per slide.  get_gpu_frame() then derives every
+    # frame with an on-device affine warp, so there is no per-frame host→device
+    # copy of a freshly-sliced crop.
+    gpu_img = cv2.cuda.GpuMat()
+    gpu_img.upload(img)
 
     return {
         'drift': True,
         'smooth': smooth,
         'sharpen': sharpen,
         'smooth_intensity': smooth_intensity,
-        'img': img,
+        'gpu_img': gpu_img,
         'start': start,
         'end': end,
     }
 
 
-def get_gpu_frame(params, frame_idx, hold_frames, gpu_scratch,
+def get_gpu_frame(params, frame_idx, hold_frames,
                   target_w=TARGET_W, target_h=TARGET_H):
-    """
-    Return a GPU mat for this slide at position frame_idx within [0, hold_frames).
-    """
+    """Return a GPU mat for this slide at position frame_idx within [0, hold_frames)."""
     if not params['drift']:
         return params['gpu_frame']
 
-    t   = frame_idx / max(hold_frames - 1, 1)
+    t = frame_idx / max(hold_frames - 1, 1)
     t_s = (1.0 - np.cos(t * np.pi)) / 2.0
 
     w0, h0, x0, y0 = params['start']
     w1, h1, x1, y1 = params['end']
 
-    ar   = target_w / target_h
+    # Fractional crop rectangle for this frame — never rounded.  Rounding the
+    # crop to whole source pixels quantises the motion to the source grid: at
+    # 4K in / 1080p out the 2:1 downscale hides it as sub-pixel movement, but
+    # at 1920x1080 in there is no scale headroom, every step becomes a whole
+    # output pixel, and the zoom visibly stutters.
     cw_f = w0 + (w1 - w0) * t_s
-    ch_f = cw_f / ar
-
     cx_f = (x0 + w0 / 2.0) + ((x1 + w1 / 2.0) - (x0 + w0 / 2.0)) * t_s
     cy_f = (y0 + h0 / 2.0) + ((y1 + h1 / 2.0) - (y0 + h0 / 2.0)) * t_s
 
-    icw = round(cw_f)
-    ich = round(ch_f)
-    icx = round(cx_f - icw / 2.0)
-    icy = round(cy_f - ich / 2.0)
+    # Map that rectangle onto the output with one affine warp.  The scale is
+    # uniform (s * ch_f == target_h by construction, since ch_f == cw_f / ar),
+    # and the -0.5/+0.5 terms put the transform on cv2.resize's pixel-centre
+    # convention so framing matches the static-slide path exactly.
+    s = target_w / cw_f
+    M = np.array([[s,   0.0, target_w / 2.0 - 0.5 + s * (0.5 - cx_f)],
+                  [0.0, s,   target_h / 2.0 - 0.5 + s * (0.5 - cy_f)]],
+                 dtype=np.float64)
 
-    crop = params['img'][icy:icy + ich, icx:icx + icw]
-    gpu_scratch.upload(crop)
-    gpu_frame = cv2.cuda.resize(gpu_scratch, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
-    smooth  = params.get('smooth')
+    gpu_out = cv2.cuda.warpAffine(params['gpu_img'], M, (target_w, target_h),
+                                  flags=cv2.INTER_CUBIC,
+                                  borderMode=cv2.BORDER_REPLICATE)
+
+    smooth = params.get('smooth')
     sharpen = params.get('sharpen')
     if smooth:
-        gpu_frame = apply_bilateral_smooth(gpu_frame, smooth, params.get('smooth_intensity'))
+        gpu_out = apply_bilateral_smooth(gpu_out, smooth, params.get('smooth_intensity'))
     if sharpen:
-        gpu_frame = apply_laplacian_boost(gpu_frame, SHARPEN_PRESETS[sharpen])
-    return gpu_frame
-
+        gpu_out = apply_laplacian_boost(gpu_out, SHARPEN_PRESETS[sharpen])
+    return gpu_out
 
 # ---------------------------------------------------------------------------
 # Image discovery
@@ -593,7 +609,8 @@ def _staircase_score(gray):
 
     sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
     sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-    angle_map = np.arctan2(sobely, sobelx)
+    #angel_map = np.arctan2(sobely, sobelx)
+    angle_map = np.arctan2(np.ascontiguousarray(sobely), np.ascontiguousarray(sobelx))
 
     edge_u8 = (edges > 0).astype(np.uint8)
     n_labels, label_map = cv2.connectedComponents(edge_u8, connectivity=8)
@@ -616,6 +633,8 @@ def _staircase_score(gray):
 
     if total_weight == 0:
         return 0.0
+
+
     return (weighted_var / total_weight) * 100.0
 
 
@@ -767,6 +786,8 @@ def generate_filter_map(img_path, threshold, smooth=None, sharpen=None):
 # Ken Burns direction logic
 # ---------------------------------------------------------------------------
 
+
+
 def _ken_burns_directions(N, base_zoom_in):
     """
     Pre-compute per-slide zoom directions using streak-based alternation.
@@ -830,9 +851,9 @@ def render_video(image_files, output_path, duration_sec, fps, trans_time_sec,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
 
-    gpu_scratch_a = cv2.cuda_GpuMat()
-    gpu_scratch_b = cv2.cuda_GpuMat()
-    gpu_black     = cv2.cuda_GpuMat(target_h, target_w, cv2.CV_8UC3, (0, 0, 0))
+    _black_cpu    = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+    gpu_black     = cv2.cuda.GpuMat()
+    gpu_black.upload(_black_cpu)
 
     # Determine per-slide zoom directions
     if ken_burns:
@@ -911,14 +932,14 @@ def render_video(image_files, output_path, duration_sec, fps, trans_time_sec,
 
                 # ---- Opening / FTB incoming: fade-in from black ----
                 if incoming in ('opening', 'ftb') and f < trans_frames:
-                    gpu_f   = get_gpu_frame(params_i, f, hold_frames, gpu_scratch_a, target_w, target_h)
+                    gpu_f   = get_gpu_frame(params_i, f, hold_frames, target_w, target_h)
                     alpha   = ease_in(f / trans_frames)
                     blended = cv2.cuda.addWeighted(gpu_f, alpha, gpu_black, 1.0 - alpha, 0.0)
                     output  = blended.download()
 
                 # ---- FTB / closing outgoing: fade-out to black ----
                 elif outgoing in ('ftb', 'closing') and f >= hold_frames - trans_frames:
-                    gpu_f   = get_gpu_frame(params_i, f, hold_frames, gpu_scratch_a, target_w, target_h)
+                    gpu_f   = get_gpu_frame(params_i, f, hold_frames, target_w, target_h)
                     t_out   = (f - (hold_frames - trans_frames)) / trans_frames
                     alpha   = ease_out(t_out)
                     blended = cv2.cuda.addWeighted(gpu_f, alpha, gpu_black, 1.0 - alpha, 0.0)
@@ -929,15 +950,15 @@ def render_video(image_files, output_path, duration_sec, fps, trans_time_sec,
                     t_idx   = f - (hold_frames - trans_frames)
                     alpha_b = ease_in(t_idx / trans_frames)
                     alpha_a = 1.0 - alpha_b
-                    gpu_f    = get_gpu_frame(params_i,    f,     hold_frames, gpu_scratch_a, target_w, target_h)
-                    gpu_next = get_gpu_frame(params_next, t_idx, hold_frames, gpu_scratch_b, target_w, target_h)
+                    gpu_f    = get_gpu_frame(params_i,    f,     hold_frames, target_w, target_h)
+                    gpu_next = get_gpu_frame(params_next, t_idx, hold_frames, target_w, target_h)
                     blended  = cv2.cuda.addWeighted(gpu_f, alpha_a, gpu_next, alpha_b, 0.0)
                     output   = blended.download()
 
                 # ---- Pure hold ----
                 else:
                     if params_i['drift']:
-                        gpu_f  = get_gpu_frame(params_i, f, hold_frames, gpu_scratch_a, target_w, target_h)
+                        gpu_f  = get_gpu_frame(params_i, f, hold_frames, target_w, target_h)
                         output = gpu_f.download()
                     else:
                         output = params_i['cpu_frame']
