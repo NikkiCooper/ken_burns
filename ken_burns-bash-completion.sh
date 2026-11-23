@@ -13,7 +13,7 @@ _ken_burns_complete() {
     local kb_opts="--ken_burns -z --zoom_in"
     local trans_opts="--ftb --random --drift --rand_drift"
     local img_proc_opts="--smooth --sharpen --smooth_intensity --use_filter_map"
-    local encoding_opts="--h264"
+    local encoding_opts="--h264 --pix_fmt --cq --dryRun --encoding_help"
     local util_opts="--calculate --filter_help --fmap_help --gen_filter_map --fmap_threshold"
 
     local all_opts="--help $file_opts $timing_opts $kb_opts $trans_opts $img_proc_opts $encoding_opts $util_opts"
@@ -90,6 +90,14 @@ _ken_burns_complete() {
             ;;
         -d|--duration|--trans_time)
             COMPREPLY=( $(compgen -W "1.0 2.0 3.0 5.0 8.0 10.0" -- "$cur") )
+            return 0
+            ;;
+        --pix_fmt)
+            COMPREPLY=( $(compgen -W "auto yuv420p p010le yuv444p16le" -- "$cur") )
+            return 0
+            ;;
+        --cq)
+            COMPREPLY=( $(compgen -W "18 20 22 24 26 28 30" -- "$cur") )
             return 0
             ;;
         -f|--fps)
