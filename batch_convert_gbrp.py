@@ -1,5 +1,27 @@
 #!/usr/bin/env python
+#  batch_convert_gbrp.py Copyright (c) 2026 Nikki Cooper
+#
+#  This program and the accompanying materials are made available under the
+#  terms of the GNU Lesser General Public License, version 3.0 which is available at
+#  https://www.gnu.org/licenses/gpl-3.0.html#license-text
+#
 
+"""
+Batch transcode GBR planar video files with NVENC.
+
+This module provides command-line batch processing for video files stored on a
+source volume and written to a target directory. It combines glob-based file
+discovery, optional numeric brace-range expansion, FFprobe stream inspection,
+parallel FFmpeg execution, output verification, and aggregate status reporting.
+
+The module is intended for workflows that need to identify source videos using the ``gbrp`` pixel format and convert
+them to HEVC using NVIDIA NVENC settings suitable for high-quality yuv444p16le (10-bit 4:4:4, HEVC RExt -> yuv444p10le)
+stream output.  This requires NVIDIA's NVENC hardware acceleration on enterprise workstation level hardware
+(RTX A4500 or higher). The ``bgrp`` pixel format is incompatible with vaapi codecs on Linux. ken_burns prior to v0.5.0
+defaulted to this mode and the result was files that were not only huge in size, but ones whose colors were washed out
+when using vaapi. This script converts a video originally transcoded this way to HEVC (Rext), yuv444p10le (also known as
+ 10-bit 4:4:4, HEVC RExt). If you have never used ken_burns before, then you do not need this utility.
+"""
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import glob
