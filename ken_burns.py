@@ -5,6 +5,18 @@
 #  terms of the GNU Lesser General Public License, version 3.0 which is available at
 #  https://www.gnu.org/licenses/gpl-3.0.html#license-text
 #
+"""
+Generate Ken Burns style video renders with NVENC-backed FFmpeg encoding.
+
+This module prepares rendered frames for FFmpeg, resolves the requested
+hardware encoder configuration, and provides a dry-run probe for validating
+NVENC support before a full render is attempted. It also exposes helper
+routines for building raw-video input arguments, output encoder arguments,
+and terminal help text for available encoding options.
+
+This module also allows for two optional CUDA filters --smooth and --sharpen that operate on each image after resizing
+on the GPU.
+"""
 import cv2
 import numpy as np
 import os
@@ -35,6 +47,260 @@ SHARPEN_PRESETS = {
     'medium': 0.45,
     'strong': 0.65,
 }
+
+# NVENC encode defaults — reference: batch_convert_gbrp.py (RTX A4500)
+DEFAULT_CQ   = 26
+PIX_FMT_CHOICES = ['auto', 'yuv420p', 'p010le', 'yuv444p16le']
+# --dryRun probe frame size. NVENC rejects tiny frames (HEVC min ≈ 129×33 on Ampere),
+# so 1×1 / 64×64 probes fail on every GPU — 256×256 clears both HEVC and H.264 minimums.
+PROBE_W, PROBE_H = 256, 256
+
+
+# ---------------------------------------------------------------------------
+# Encoding
+# ---------------------------------------------------------------------------
+
+def resolve_encoding(use_hevc, pix_fmt='auto'):
+    """
+    Resolves codec, encoder input pixel format, and profile.
+
+    auto → yuv444p16le (HEVC, NVENC emits yuv444p10le / RExt) or yuv420p (H.264).
+    -profile:v rext is only forced for HEVC + yuv444p16le; all other combinations
+    let NVENC pick (main / main10 / high).
+
+    :return: (codec, pix_fmt, profile or None)
+    :rtype: tuple
+    """
+    codec = "hevc_nvenc" if use_hevc else "h264_nvenc"
+    if pix_fmt == 'auto':
+        pix_fmt = 'yuv444p16le' if use_hevc else 'yuv420p'
+    profile = 'rext' if (use_hevc and pix_fmt == 'yuv444p16le') else None
+    return codec, pix_fmt, profile
+
+
+def build_encode_args(use_hevc, pix_fmt='auto', cq=DEFAULT_CQ):
+    """
+    Builds the ffmpeg output-side encoder flags shared by render_video() and the
+    --dryRun probe, so the probe tests exactly what the render will use.
+    Muxer-only flags (-movflags, -metadata) are added by the caller.
+
+    :return: List of ffmpeg arguments.
+    :rtype: list
+    """
+    codec, pix_fmt, profile = resolve_encoding(use_hevc, pix_fmt)
+    return [
+        "-c:v", codec, "-preset", "p7", "-tune", "hq",
+        *(["-profile:v", profile] if profile else []),
+        "-pix_fmt", pix_fmt,
+        "-colorspace", "bt709", "-color_primaries", "bt709",
+        "-color_trc", "bt709", "-color_range", "tv",
+        "-rc", "vbr", "-cq", str(cq), "-b:v", "0",
+        "-g", "250", "-bf", "4", "-b_ref_mode", "middle", "-rc-lookahead", "32",
+        "-spatial-aq", "1", "-aq-strength", "4",
+        "-an",
+    ]
+
+
+def raw_input_args(target_w, target_h, fps):
+    """
+    ffmpeg input flags for the bgr24 rawvideo pipe fed by render_video().
+
+    Primaries / trc are tagged on the input as well: with FFmpeg ≥ 9 the
+    output-side -color_primaries / -color_trc alone are dropped by filter
+    colour negotiation and the stream ends up 'unknown' (matrix/range survive).
+    """
+    return [
+        "-f", "rawvideo", "-vcodec", "rawvideo",
+        "-s", f"{target_w}x{target_h}",
+        "-pix_fmt", "bgr24",
+        "-r", str(fps),
+        "-color_primaries", "bt709", "-color_trc", "bt709",
+        "-i", "pipe:0",
+    ]
+
+
+def _stderr_tail(text, lines=20):
+    return "\n".join(text.strip().splitlines()[-lines:])
+
+
+def probe_encoder(use_hevc, pix_fmt='auto', cq=DEFAULT_CQ, fps=30):
+    """
+    Encodes one bgr24 PROBE_W×PROBE_H frame to `-f null -` with the resolved encoder
+    flags. Exercises the real driver / NVENC session / FFmpeg build for the exact
+    codec + pix_fmt + profile combination.
+
+    :return: (ok, elapsed_ms, stderr_text)
+    :rtype: tuple
+    """
+    import time
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
+           *raw_input_args(PROBE_W, PROBE_H, fps),
+           "-frames:v", "1",
+           *build_encode_args(use_hevc, pix_fmt, cq),
+           "-f", "null", "-"]
+    frame = bytes(PROBE_W * PROBE_H * 3)
+    t0 = time.perf_counter()
+    try:
+        res = subprocess.run(cmd, input=frame, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.PIPE, timeout=30)
+    except FileNotFoundError:
+        return False, 0.0, "ffmpeg not found in PATH"
+    except subprocess.TimeoutExpired:
+        return False, (time.perf_counter() - t0) * 1000, "ffmpeg probe timed out (30s)"
+    elapsed = (time.perf_counter() - t0) * 1000
+    return res.returncode == 0, elapsed, res.stderr.decode(errors='replace')
+
+
+def run_dry_run(use_hevc, pix_fmt='auto', cq=DEFAULT_CQ, fps=30):
+    """
+    Prints the resolved encoding configuration and the result of probe_encoder().
+
+    :return: True if the probe succeeded.
+    :rtype: bool
+    """
+    bc = Bcolors()
+    codec, r_pix, profile = resolve_encoding(use_hevc, pix_fmt)
+    sep = f"{bc.BOLD + bc.Dark_Gray_f}{'─' * 58}{bc.ENDC}"
+    print()
+    print(f"{bc.BOLD + bc.White_f}  Ken Burns  {bc.Magenta_f}─{bc.OKBLUE}  NVENC Dry Run{bc.ENDC}")
+    print(sep)
+    print(f"  {bc.BOLD + bc.Magenta_f}Codec        {bc.White_f}: {bc.OKBLUE}{codec}{bc.ENDC}")
+    print(f"  {bc.BOLD + bc.Magenta_f}Pix Fmt      {bc.White_f}: {bc.OKBLUE}{r_pix}"
+          f"{bc.Dark_Gray_f}{('  (default)' if use_hevc else '  (auto: --h264 fallback)') if pix_fmt == 'auto' else ''}{bc.ENDC}")
+    print(f"  {bc.BOLD + bc.Magenta_f}Profile      {bc.White_f}: {bc.OKBLUE}{profile or 'encoder default'}{bc.ENDC}")
+    print(f"  {bc.BOLD + bc.Magenta_f}CQ           {bc.White_f}: {bc.OKBLUE}{cq}{bc.ENDC}")
+    print(f"  {bc.BOLD + bc.Magenta_f}Probe        {bc.White_f}: {bc.Dark_Gray_f}1 frame, "
+          f"{PROBE_W}x{PROBE_H} bgr24 @ {fps}fps → -f null -{bc.ENDC}")
+    print(sep)
+    ok, ms, err = probe_encoder(use_hevc, pix_fmt, cq, fps)
+    if ok:
+        print(f"  {bc.BOLD + bc.Green_f}PASS{bc.Dark_Gray_f}  ({ms:.0f} ms){bc.ENDC}")
+    else:
+        print(f"  {bc.BOLD + bc.Red_f}FAIL{bc.Dark_Gray_f}  ({ms:.0f} ms){bc.ENDC}")
+        for line in _stderr_tail(err).splitlines():
+            print(f"  {bc.Yellow_f}{line}{bc.ENDC}")
+    print()
+    return ok
+
+
+def print_encoding_help():
+    """
+    Prints help information for the encoding options.
+
+    :return: None
+    :rtype: None
+    """
+    bc = Bcolors()
+    sep  = f"{bc.BOLD + bc.Dark_Gray_f}{'─' * 68}{bc.ENDC}"
+    sep2 = f"{bc.Dark_Gray_f}{'╌' * 68}{bc.ENDC}"
+
+    def hdr(title):
+        print(f"\n{bc.BOLD + bc.White_f}  {title}{bc.ENDC}")
+        print(sep)
+
+    def sub(title):
+        print(f"\n{bc.BOLD + bc.Cyan_f}  {title}{bc.ENDC}")
+        print(sep2)
+
+    def row(label, value):
+        print(f"  {bc.BOLD + bc.Magenta_f}{label:<22}{bc.White_f}: {value}{bc.ENDC}")
+
+    def para(text):
+        import textwrap
+        for line in textwrap.wrap(text, width=64):
+            print(f"  {bc.Dark_Gray_f}{line}{bc.ENDC}")
+
+    def cmd(text):
+        print(f"  {bc.OKBLUE}{text}{bc.ENDC}")
+
+    print()
+    print(f"{bc.BOLD + bc.White_f}  Ken Burns  {bc.Magenta_f}─{bc.OKBLUE}  Encoding Reference{bc.ENDC}")
+    print(sep)
+
+    hdr("Overview")
+    para("Frames leave the GPU pipeline as 8-bit bgr24 at the target resolution "
+         "and are piped to ffmpeg. All warps, zoom, drift, transitions and "
+         "filters happen before this point — encoding options only change how "
+         "ffmpeg converts and compresses those frames.")
+    print()
+    para("Default is HEVC 10-bit 4:4:4 (RExt) via NVENC, matching "
+         "batch_convert_gbrp.py. Slow sub-pixel Ken Burns / drift motion exposes "
+         "quantization stepping and chroma edge shimmer; full chroma and 10-bit "
+         "precision keep both under control.")
+    print()
+    row("Codec",    "hevc_nvenc  -preset p7 -tune hq")
+    row("Pix fmt",  "yuv444p16le in → yuv444p10le out  (-profile:v rext)")
+    row("Rate",     "-rc vbr -cq 26 -b:v 0")
+    row("GOP / B",  "-g 250 -bf 4 -b_ref_mode middle -rc-lookahead 32")
+    row("AQ",       "-spatial-aq 1 -aq-strength 4")
+    row("Color",    "bt709 matrix/primaries/trc, tv (limited) range")
+    row("Container", "-an  -movflags +faststart")
+
+    hdr("Options")
+
+    sub("--pix_fmt  yuv444p16le (default) | p010le | yuv420p | auto")
+    row("yuv444p16le", "10-bit 4:4:4, HEVC RExt. Default, best quality")
+    row("p010le",      "10-bit 4:2:0, HEVC Main10")
+    row("yuv420p",     "8-bit 4:2:0, HEVC Main / H.264 High")
+    row("auto",        "yuv444p16le; yuv420p only with --h264")
+    print()
+    para("yuv444p16le and HEVC RExt are one setting: yuv444p16le is the "
+         "format ffmpeg hands to NVENC (16-bit container, full chroma). NVENC "
+         "encodes its top 10 bits as a yuv444p10le stream, and 4:4:4 10-bit "
+         "requires the RExt profile, so -profile:v rext is set automatically.")
+    print()
+    para("'auto' exists only so --h264 keeps working. H.264 NVENC cannot "
+         "encode 4:4:4 10-bit, so auto falls back to yuv420p there. Without "
+         "--h264, auto and yuv444p16le are identical.")
+    print()
+    para("Use yuv444p16le (default) for archival masters and local playback. "
+         "Encoding RExt 4:4:4 needs a pro / datacenter NVENC (e.g. RTX A4500); "
+         "most GeForce cards (e.g. RTX 3060) can decode yuv444p10le via NVDEC "
+         "but cannot encode it.")
+    print()
+    para("Use p010le when you need wide compatibility but want to keep 10-bit "
+         "gradients. Main10 encodes and plays back on nearly every modern GPU, "
+         "TV and phone. It keeps smooth gradients on slow zooms, but chroma "
+         "is subsampled.")
+    print()
+    para("Use yuv420p for maximum compatibility (browsers, web uploads, older "
+         "hardware). 8-bit 4:2:0 is the most likely to show banding and "
+         "chroma shimmer on slow motion. Pair with a lower --cq.")
+
+    sub("--h264")
+    para("Switch to h264_nvenc. Use only when the target cannot decode HEVC. "
+         "auto resolves to yuv420p. H.264 NVENC does not encode 10-bit on "
+         "most GPUs, so --h264 with p010le / yuv444p16le will usually fail. "
+         "Expect larger files than HEVC at the same CQ.")
+
+    sub("--cq  1–51")
+    para("NVENC constant-quality target in VBR mode (-b:v 0 = no bitrate "
+         "cap). Lower = higher quality / larger file. 26 matches "
+         "batch_convert_gbrp.py. Use 20–24 for yuv420p or H.264 "
+         "when slow motion shows stepping. Above ~30, expect visible "
+         "artefacts on gradients.")
+
+    sub("--dryRun")
+    para("Encodes one 256×256 frame with the exact resolved codec / pix_fmt / "
+         "profile / CQ flags to -f null, then exits. Takes about 0.3 s, mostly "
+         "CUDA/NVENC startup. This tests the real driver, NVENC session limit "
+         "and FFmpeg build, not GPU model strings.")
+    print()
+    para("Run it before long renders, on a new machine, or after a driver / "
+         "FFmpeg upgrade. It catches unsupported profiles (RExt on GeForce), "
+         "unsupported pixel formats, exhausted NVENC sessions, outdated "
+         "drivers, and FFmpeg builds without NVENC — before you have spent "
+         "an hour on GPU frames. It needs no --img_path or --output.")
+    print()
+    cmd("python ken_burns.py --dryRun")
+    cmd("python ken_burns.py --dryRun --h264")
+    cmd("python ken_burns.py --dryRun --pix_fmt p010le --cq 24")
+
+    hdr("Errors")
+    para("ffmpeg runs with -loglevel error. Normal renders are silent. If "
+         "ffmpeg exits non-zero or the pipe breaks, its stderr is printed "
+         "with the frame count reached.")
+    print()
 
 
 # ---------------------------------------------------------------------------
@@ -736,7 +1002,7 @@ def generate_filter_map(img_path, threshold, smooth=None, sharpen=None):
     print(sep)
     for fname, var in scores_sorted:
         if var is None:
-            score_str  = f"{bc.GD_RED}{'unreadable':>8}{bc.ENDC}"
+            score_str  = f"{bc.BOLD + bc.Red_f}{'unreadable':>8}{bc.ENDC}"
             action_str = f"{bc.Dark_Gray_f}skip{bc.ENDC}"
         elif var > threshold:
             eff_smooth  = smooth  if smooth  else _score_to_preset(var, threshold)
@@ -818,7 +1084,8 @@ def render_video(image_files, output_path, duration_sec, fps, trans_time_sec,
                  transition_types, drift_value, rand_drift, use_hevc,
                  smooth=None, sharpen=None, smooth_intensity=None, filter_map_data=None,
                  ken_burns=False, base_zoom_in=False,
-                 metadata_comment=None, target_w=TARGET_W, target_h=TARGET_H):
+                 metadata_comment=None, target_w=TARGET_W, target_h=TARGET_H,
+                 pix_fmt='auto', cq=DEFAULT_CQ):
     """
     Direct GPU-accelerated pipeline. (mostly)
 
@@ -827,29 +1094,48 @@ def render_video(image_files, output_path, duration_sec, fps, trans_time_sec,
       ken_burns=True          — full Ken Burns zoom (drift_value forced to 1.0),
                                 streak-based alternating direction
       ken_burns=False, drift  — subtle configurable drift (0.0 = static hold)
+    Encoding:
+      bgr24 frames are piped to ffmpeg; flags from build_encode_args()
+      (default HEVC RExt yuv444p10le, CQ 26 — see --encoding_help).
+      ffmpeg stderr is buffered to a temp file and printed only on failure.
     """
+    import tempfile
     bc = Bcolors()
     N           = len(image_files)
     hold_frames = int(duration_sec * fps)
     trans_frames = int(trans_time_sec * fps)
 
-    codec = "hevc_nvenc" if use_hevc else "h264_nvenc"
     ffmpeg_cmd = [
-        "ffmpeg", "-y",
-        "-f", "rawvideo", "-vcodec", "rawvideo",
-        "-s", f"{target_w}x{target_h}",
-        "-pix_fmt", "bgr24",
-        "-r", str(fps),
-        "-i", "pipe:0",
-        "-an",
-        "-c:v", codec, "-preset", "p4", "-cq", "22",
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats", "-y",
+        *raw_input_args(target_w, target_h, fps),
+        *build_encode_args(use_hevc, pix_fmt, cq),
+        "-movflags", "+faststart",
         *((["-metadata", f"comment={metadata_comment}"]) if metadata_comment else []),
         output_path
     ]
+    # stderr goes to a temp file, not a PIPE: an undrained PIPE can fill and
+    # deadlock ffmpeg while we block writing frames to stdin.
+    err_log = tempfile.TemporaryFile()
     proc = subprocess.Popen(
         ffmpeg_cmd, stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        stdout=subprocess.DEVNULL, stderr=err_log
     )
+    frames_written = 0
+
+    def fail(reason):
+        try:
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+        proc.wait()
+        err_log.seek(0)
+        err = _stderr_tail(err_log.read().decode(errors='replace'))
+        err_log.close()
+        print(f"\n{bc.BOLD + bc.Red_f}Pipeline error: {reason} "
+              f"(exit code {proc.returncode}, after {frames_written} frames).{bc.ENDC}")
+        for line in (err or "(no ffmpeg stderr output)").splitlines():
+            print(f"  {bc.Yellow_f}{line}{bc.ENDC}")
+        return False
 
     _black_cpu    = np.zeros((target_h, target_w, 3), dtype=np.uint8)
     gpu_black     = cv2.cuda.GpuMat()
@@ -916,7 +1202,7 @@ def render_video(image_files, output_path, duration_sec, fps, trans_time_sec,
 
             params_i = load_slide(i)
             if params_i is None:
-                print(f"  {bc.GD_RED}Warning: could not load image {i + 1}, skipping.{bc.ENDC}")
+                print(f"  {bc.BOLD + bc.Red_f}Warning: could not load image {i + 1}, skipping.{bc.ENDC}")
                 continue
 
             incoming = 'opening' if i == 0         else transition_types[i - 1]
@@ -964,14 +1250,16 @@ def render_video(image_files, output_path, duration_sec, fps, trans_time_sec,
                         output = params_i['cpu_frame']
 
                 proc.stdin.write(output)
+                frames_written += 1
 
+        proc.stdin.close()   # flush may also raise BrokenPipeError
     except BrokenPipeError:
-        print(f"\n{bc.GD_RED}Pipeline error: ffmpeg exited unexpectedly.{bc.ENDC}")
-        proc.wait()
-        return False
+        return fail("ffmpeg exited unexpectedly (broken pipe)")
 
-    proc.stdin.close()
-    return proc.wait() == 0
+    if proc.wait() != 0:
+        return fail("ffmpeg exited non-zero")
+    err_log.close()
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1077,6 +1365,7 @@ def calculate_report(opts, img_path):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    from version import __version__
     bc = Bcolors()
     opts, src_path, dest_vid = cliOpts()
 
@@ -1146,7 +1435,7 @@ if __name__ == "__main__":
     script_name = "Ken Burns" if ken_burns_mode else "Fade"
     sep = f"{bc.BOLD + bc.Dark_Gray_f}{'─' * 58}{bc.ENDC}"
     print()
-    print(f"{bc.BOLD + bc.White_f}  {script_name}  {bc.Magenta_f}─{bc.OKBLUE}  Direct GPU Pipeline{bc.ENDC}")
+    print(f"{bc.BOLD + bc.White_f}  {script_name} {bc.Light_Yellow_f} v{__version__} {bc.Magenta_f}─{bc.OKBLUE}  Direct GPU Pipeline{bc.ENDC}")
     print(sep)
     print(f"  {bc.BOLD + bc.Magenta_f}Source       {bc.White_f}: {bc.OKBLUE}{src_path}{bc.ENDC}")
     print(f"  {bc.BOLD + bc.Magenta_f}Output       {bc.White_f}: {bc.OKBLUE}{dest_vid}{bc.ENDC}")
@@ -1178,8 +1467,10 @@ if __name__ == "__main__":
         sharpen_label = f"{bc.Dark_Gray_f}off{bc.ENDC}"
     print(f"  {bc.BOLD + bc.Magenta_f}Sharpen      {bc.White_f}: {sharpen_label}")
     print(f"  {bc.BOLD + bc.Magenta_f}Filter Map   {bc.White_f}: {filter_map_label}")
+    enc_codec, enc_pix, enc_profile = resolve_encoding(use_hevc, opts.pix_fmt)
     print(f"  {bc.BOLD + bc.Magenta_f}Codec        {bc.White_f}: {bc.OKBLUE}"
-          f"{'HEVC (H.265 via NVENC)' if use_hevc else 'H.264 (via NVENC)'}{bc.ENDC}")
+          f"{'HEVC (H.265 via NVENC)' if use_hevc else 'H.264 (via NVENC)'}{bc.Dark_Gray_f}  "
+          f"({enc_pix}{', ' + enc_profile if enc_profile else ''}, cq {opts.cq}){bc.ENDC}")
     print(sep)
     print()
 
@@ -1204,13 +1495,16 @@ if __name__ == "__main__":
         + f" | Sharpen: {sharpen or 'off'}"
         f" | FilterMap: {fmap_meta}"
         f" | Codec: {'HEVC' if use_hevc else 'H.264'}"
+        f" | PixFmt: {enc_pix}"
+        f" | CQ: {opts.cq}"
     )
 
     ok = render_video(
         image_files, dest_vid, duration_sec, fps, trans_time,
         transition_types, drift_value, opts.rand_drift, use_hevc,
         smooth, sharpen, smooth_intensity, filter_map_data,
-        ken_burns_mode, base_zoom_in, metadata_comment
+        ken_burns_mode, base_zoom_in, metadata_comment,
+        pix_fmt=opts.pix_fmt, cq=opts.cq
     )
 
     if ok:
