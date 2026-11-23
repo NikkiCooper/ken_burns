@@ -4,6 +4,30 @@
 #  terms of the GNU Lesser General Public License, version 3.0 which is available at
 #  https://www.gnu.org/licenses/gpl-3.0.html#license-text
 #
+"""Define command-line options for the Ken Burns slideshow generator.
+
+This module configures the command-line interface used to control slideshow
+generation, timing, transitions, Ken Burns motion, subtle drift effects, and
+CUDA-assisted image processing options. The configured options describe source
+and output paths, frame timing, transition behavior, zoom behavior, smoothing,
+and sharpening controls for the video generation workflow.
+
+Functions
+---------
+cliOpts
+    Configure command-line option definitions for the slideshow generator.
+
+Notes
+-----
+The command-line interface uses grouped options to organize related settings.
+Color formatting is applied to help text when terminal color support is
+available through the configured color helper.
+
+See Also
+--------
+argparse.ArgumentParser
+    Standard library parser used to define command-line arguments.
+"""
 import os
 import sys
 import argparse
