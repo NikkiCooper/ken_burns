@@ -8,12 +8,12 @@ import os
 import sys
 import argparse
 from Bcolors import Bcolors
-
+from version import __version__
 
 def cliOpts():
     bc = Bcolors()
     parser = argparse.ArgumentParser(
-        description="Ken Burns: GPU-accelerated slideshow — Ken Burns zoom, crossfade dissolve, or fade-to-black",
+        description=f"Ken Burns {bc.Light_Yellow_f}v{__version__}{bc.RESET}: GPU-accelerated slideshow — Ken Burns zoom, crossfade dissolve, or fade-to-black",
         formatter_class=argparse.RawTextHelpFormatter
     )
 
@@ -134,8 +134,32 @@ def cliOpts():
     # -------------------------------------------------------------------------
     grp_enc = parser.add_argument_group("Encoding")
     grp_enc.add_argument("--h264", action="store_true", dest="h264", default=False,
-                         help=f"Use H.264 instead of default HEVC (H.265) via NVENC\n"
+                         help=f"Use h264_nvenc instead of default hevc_nvenc\n"
+                              f"  Compatibility opt-out only; --pix_fmt auto → yuv420p\n"
                               f"{bc.BOLD+bc.Magenta_f}Default: {bc.OKBLUE}HEVC{bc.ENDC}")
+    grp_enc.add_argument("--pix_fmt", action="store", type=str, dest="pix_fmt", default="auto",
+                         choices=["auto", "yuv420p", "p010le", "yuv444p16le"],
+                         help=f"Encoder input pixel format (converted from bgr24)\n"
+                              f"  yuv444p16le : 10-bit 4:4:4, HEVC RExt → yuv444p10le stream  (default)\n"
+                              f"                Requires pro NVENC for encode (e.g. RTX A4500)\n"
+                              f"  p010le      : 10-bit 4:2:0, HEVC Main10\n"
+                              f"  yuv420p     : 8-bit 4:2:0, max compatibility\n"
+                              f"  auto        : yuv444p16le; falls back to yuv420p only with --h264\n"
+                              f"                (H.264 NVENC cannot encode 4:4:4 10-bit)\n"
+                              f"  See --encoding_help for full guidance\n"
+                              f"{bc.BOLD+bc.Magenta_f}Default: {bc.OKBLUE}yuv444p16le  {bc.Dark_Gray_f}(HEVC RExt, 10-bit 4:4:4){bc.ENDC}")
+    grp_enc.add_argument("--cq", action="store", type=int, dest="cq", default=26, metavar="1-51",
+                         help=f"NVENC constant quality  (VBR, -b:v 0)\n"
+                              f"  Lower = higher quality / larger file\n"
+                              f"{bc.BOLD+bc.Magenta_f}Default: {bc.OKBLUE}26{bc.ENDC}")
+    grp_enc.add_argument("--dryRun", action="store_true", dest="dryRun", default=False,
+                         help=f"Probe ffmpeg/NVENC with 1 frame using the resolved\n"
+                              f"  --h264 / --pix_fmt / --cq flags, report PASS/FAIL, exit\n"
+                              f"  Catches unsupported profile/pix_fmt, driver, session, build issues\n"
+                              f"{bc.BOLD+bc.Magenta_f}No other arguments required{bc.ENDC}")
+    grp_enc.add_argument("--encoding_help", action="store_true", dest="encoding_help", default=False,
+                         help=f"Print comprehensive guidance on --h264, --pix_fmt, --cq, --dryRun\n"
+                              f"{bc.BOLD+bc.Magenta_f}No other arguments required{bc.ENDC}")
 
     # -------------------------------------------------------------------------
     # Utility
@@ -171,7 +195,20 @@ def cliOpts():
 
     options = parser.parse_args()
 
-    # ---- filter_help / fmap_help: no other args needed ----
+    # ---- filter_help / fmap_help / encoding_help / dryRun: no other args needed ----
+    if options.encoding_help:
+        from ken_burns import print_encoding_help
+        print_encoding_help()
+        sys.exit(0)
+
+    if not (1 <= options.cq <= 51):
+        print(f"{bc.BOLD+bc.Red_f}--cq must be in range 1–51 (got {options.cq}){bc.ENDC}")
+        sys.exit(1)
+
+    if options.dryRun:
+        from ken_burns import run_dry_run
+        sys.exit(0 if run_dry_run(not options.h264, options.pix_fmt, options.cq, options.fps) else 1)
+
     if options.filter_help:
         from ken_burns import print_filter_help
         print_filter_help()
