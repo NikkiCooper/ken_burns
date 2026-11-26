@@ -27,6 +27,7 @@ import random
 import subprocess
 from cliOpts import cliOpts
 from Bcolors import Bcolors
+from version import __version__
 
 # In my workflow implementation, we are down-scaling the images from 3840x2160 to a target resolution of 1920x1080 pixels.
 TARGET_W = 1920
@@ -254,9 +255,13 @@ def print_encoding_help():
          "--h264, auto and yuv444p16le are identical.")
     print()
     para("Use yuv444p16le (default) for archival masters and local playback. "
-         "Encoding RExt 4:4:4 needs a pro / datacenter NVENC (e.g. RTX A4500); "
-         "most GeForce cards (e.g. RTX 3060) can decode yuv444p10le via NVDEC "
-         "but cannot encode it.")
+         "HEVC 4:4:4 10-bit encode is supported on GeForce and pro NVENC alike "
+         "from Pascal onward (RTX 3060 and RTX A4500 have identical codec "
+         "features). The default flags also use HEVC B-frames (-bf 4, "
+         "-b_ref_mode middle), which need 7th-gen NVENC (GTX 1660 / RTX 20 "
+         "or newer). Pascal and GTX 1650/1630 lack HEVC B-frames. Maxwell has "
+         "no 4:4:4 or 10-bit HEVC encode. The harder limit is playback: many "
+         "browsers, TVs and phones cannot decode 4:4:4.")
     print()
     para("Use p010le when you need wide compatibility but want to keep 10-bit "
          "gradients. Main10 encodes and plays back on nearly every modern GPU, "
@@ -269,8 +274,9 @@ def print_encoding_help():
 
     sub("--h264")
     para("Switch to h264_nvenc. Use only when the target cannot decode HEVC. "
-         "auto resolves to yuv420p. H.264 NVENC does not encode 10-bit on "
-         "most GPUs, so --h264 with p010le / yuv444p16le will usually fail. "
+         "auto resolves to yuv420p. H.264 NVENC does not encode 10-bit before "
+         "Blackwell, so --h264 with p010le / yuv444p16le fails on Ampere/Ada "
+         "and older (verified on RTX A4500). "
          "Expect larger files than HEVC at the same CQ.")
 
     sub("--cq  1–51")
@@ -287,8 +293,9 @@ def print_encoding_help():
          "and FFmpeg build, not GPU model strings.")
     print()
     para("Run it before long renders, on a new machine, or after a driver / "
-         "FFmpeg upgrade. It catches unsupported profiles (RExt on GeForce), "
-         "unsupported pixel formats, exhausted NVENC sessions, outdated "
+         "FFmpeg upgrade. It catches unsupported profiles / B-frame modes "
+         "(older NVENC generations), unsupported pixel formats (10-bit H.264), "
+         "exhausted NVENC sessions (GeForce: 12 concurrent), outdated "
          "drivers, and FFmpeg builds without NVENC — before you have spent "
          "an hour on GPU frames. It needs no --img_path or --output.")
     print()
@@ -569,7 +576,7 @@ def print_fmap_help():
     sub("Step 4 — Render")
     para("Add --use_filter_map to load filter_map.json from --img_path:")
     print()
-    cmd("python ken_burns.py --img_path /path/to/imgs -o ~/out.mp4 --use_filter_map")
+    cmd("python ken_burns.py --img_path /path/to/imgs -o ~/out.mp4 --suffix AI_Kenburns --use_filter_map")
     print()
     para("If filter_map.json is not found in --img_path, an error is printed "
          "explaining that it needs to be generated first with --gen_filter_map.")
@@ -645,12 +652,12 @@ def print_fmap_help():
     cmd("python ken_burns.py --img_path ~/imgs/set_042 --gen_filter_map --smooth light")
     print()
     cmd("# Edit ~/imgs/set_042/filter_map.json if needed, then render")
-    cmd("python ken_burns.py --img_path ~/imgs/set_042 -o ~/out/set_042.mp4 \\")
+    cmd("python ken_burns.py --img_path ~/imgs/set_042 -o ~/out/set_042.mp4 --suffix AI_Kenburns \\")
     cmd("    --duration 9 --drift 0.33 --rand_drift --use_filter_map")
     print()
 
     sub("Ken Burns mode with filter map")
-    cmd("python ken_burns.py --img_path ~/imgs/set_042 -o ~/out/set_042.mp4 \\")
+    cmd("python ken_burns.py --img_path ~/imgs/set_042 -o ~/out/set_042.mp4 --suffix AI_Kenburns \\")
     cmd("    --ken_burns --ftb --duration 9 --use_filter_map --smooth subtle")
     para("  Images in the map use their per-image settings. Images not in "
          "the map get --smooth subtle as fallback.")
@@ -855,7 +862,7 @@ def collect_images(img_path):
     extensions = ('*.jpg', '*.jpeg', '*.png', '*.JPG', '*.JPEG', '*.PNG')
     files = []
     for ext in extensions:
-        files.extend(glob.glob(os.path.join(img_path, ext)))
+        files.extend(glob.glob(os.path.join(glob.escape(img_path), ext)))
     files.sort()
     return files
 
@@ -1106,7 +1113,7 @@ def render_video(image_files, output_path, duration_sec, fps, trans_time_sec,
     trans_frames = int(trans_time_sec * fps)
 
     ffmpeg_cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats", "-y",
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats", "-n",
         *raw_input_args(target_w, target_h, fps),
         *build_encode_args(use_hevc, pix_fmt, cq),
         "-movflags", "+faststart",
@@ -1361,27 +1368,48 @@ def calculate_report(opts, img_path):
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Render driver (single folder and batch)
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    from version import __version__
+def _publish(tmp_path, dest_path):
+    """
+    Move a finished render to its final name without ever replacing a file.
+
+    A hard link is atomic and fails if the destination exists; on filesystems
+    without hard links fall back to check-then-rename.
+
+    :return: None on success, otherwise a message explaining why it was not moved.
+    """
+    try:
+        os.link(tmp_path, dest_path)
+    except FileExistsError:
+        return f"Output appeared while rendering and was not replaced: {dest_path}"
+    except OSError:
+        if os.path.exists(dest_path):
+            return f"Output appeared while rendering and was not replaced: {dest_path}"
+        os.rename(tmp_path, dest_path)
+        return None
+    os.unlink(tmp_path)
+    return None
+
+
+def render_one(opts, src_path, dest_vid, position=""):
+    """
+    Render one image folder to one video.
+
+    :param opts: Parsed command-line options.
+    :param src_path: Image folder.
+    :param dest_vid: Output video path (must not exist).
+    :param position: Batch position label, e.g. "[2/5] ".
+    :return: True when the video was written.
+    :rtype: bool
+    """
     bc = Bcolors()
-    opts, src_path, dest_vid = cliOpts()
-
-    if opts.calculate:
-        calculate_report(opts, src_path)
-        sys.exit(0)
-
-    if opts.gen_filter_map:
-        generate_filter_map(src_path, opts.fmap_threshold, opts.smooth, opts.sharpen)
-        sys.exit(0)
-
     image_files = collect_images(src_path)
     N = len(image_files)
     if N == 0:
         print(f"{bc.BOLD + bc.Red_f}No valid images found in: {bc.OKBLUE}{src_path}{bc.ENDC}")
-        sys.exit(1)
+        return False
 
     use_hevc      = not opts.h264
     duration_sec  = opts.duration
@@ -1424,7 +1452,7 @@ if __name__ == "__main__":
             print(f"\n{bc.BOLD + bc.Red_f}  filter_map.json not found in --img_path.{bc.ENDC}")
             print(f"  {bc.Dark_Gray_f}Generate one first:{bc.ENDC}")
             print(f"  {bc.OKBLUE}  python ken_burns.py --img_path {src_path} --gen_filter_map{bc.ENDC}\n")
-            sys.exit(1)
+            return False
         with open(fmap_path) as fh:
             raw = json.load(fh)
         filter_map_data = {k: v for k, v in raw.items() if not k.startswith('_')}
@@ -1435,7 +1463,7 @@ if __name__ == "__main__":
     script_name = "Ken Burns" if ken_burns_mode else "Fade"
     sep = f"{bc.BOLD + bc.Dark_Gray_f}{'─' * 58}{bc.ENDC}"
     print()
-    print(f"{bc.BOLD + bc.White_f}  {script_name} {bc.Light_Yellow_f} v{__version__} {bc.Magenta_f}─{bc.OKBLUE}  Direct GPU Pipeline{bc.ENDC}")
+    print(f"{bc.BOLD + bc.White_f}  {position}{script_name} {bc.Light_Yellow_f} v{__version__} {bc.Magenta_f}─{bc.OKBLUE}  Direct GPU Pipeline{bc.ENDC}")
     print(sep)
     print(f"  {bc.BOLD + bc.Magenta_f}Source       {bc.White_f}: {bc.OKBLUE}{src_path}{bc.ENDC}")
     print(f"  {bc.BOLD + bc.Magenta_f}Output       {bc.White_f}: {bc.OKBLUE}{dest_vid}{bc.ENDC}")
@@ -1499,16 +1527,128 @@ if __name__ == "__main__":
         f" | CQ: {opts.cq}"
     )
 
-    ok = render_video(
-        image_files, dest_vid, duration_sec, fps, trans_time,
-        transition_types, drift_value, opts.rand_drift, use_hevc,
-        smooth, sharpen, smooth_intensity, filter_map_data,
-        ken_burns_mode, base_zoom_in, metadata_comment,
-        pix_fmt=opts.pix_fmt, cq=opts.cq
-    )
+    # Render to a hidden temporary file beside the target and move it into place
+    # only on success: a failed or interrupted render never leaves a partial
+    # video under the final name (which would block every re-run).
+    stem, ext = os.path.splitext(os.path.basename(dest_vid))
+    tmp_vid = os.path.join(os.path.dirname(os.path.abspath(dest_vid)),
+                           f".{stem}.partial-{os.getpid()}{ext}")
+    keep_tmp = False
+    try:
+        ok = render_video(
+            image_files, tmp_vid, duration_sec, fps, trans_time,
+            transition_types, drift_value, opts.rand_drift, use_hevc,
+            smooth, sharpen, smooth_intensity, filter_map_data,
+            ken_burns_mode, base_zoom_in, metadata_comment,
+            pix_fmt=opts.pix_fmt, cq=opts.cq
+        )
+        if ok:
+            problem = _publish(tmp_vid, dest_vid)
+            if problem:
+                keep_tmp = True
+                print(f"\n{bc.BOLD + bc.Red_f}{problem}{bc.ENDC}")
+                print(f"  {bc.Dark_Gray_f}The finished render was kept as: {bc.OKBLUE}{tmp_vid}{bc.ENDC}\n")
+                return False
+    finally:
+        if not keep_tmp and os.path.exists(tmp_vid):
+            os.unlink(tmp_vid)
 
     if ok:
         print(f"\n{bc.BOLD + bc.Green_f}✨ Done.{bc.White_f}  Video saved to: {bc.OKBLUE}{dest_vid}{bc.ENDC}\n")
-    else:
-        print(f"\n{bc.BOLD + bc.Red_f}Render failed.{bc.ENDC}\n")
-        sys.exit(1)
+        return True
+    print(f"\n{bc.BOLD + bc.Red_f}Render failed.{bc.ENDC}\n")
+    return False
+
+
+def print_batch_summary(results, total, elapsed, interrupted):
+    """
+    Print the end-of-batch summary.
+
+    :param results: list of (job, status, detail) with status DONE | FAILED | SKIPPED.
+    """
+    bc = Bcolors()
+    done    = [r for r in results if r[1] == "DONE"]
+    failed  = [r for r in results if r[1] == "FAILED"]
+    skipped = [r for r in results if r[1] == "SKIPPED"]
+    mins, secs = divmod(int(elapsed), 60)
+    sep = f"{bc.BOLD + bc.Dark_Gray_f}{'─' * 58}{bc.ENDC}"
+    print()
+    print(f"{bc.BOLD + bc.White_f}  Batch summary {bc.Magenta_f}─{bc.OKBLUE}  "
+          f"{len(results)} of {total} folders in {mins}m{secs:02d}s{bc.ENDC}")
+    print(sep)
+    print(f"  {bc.BOLD + bc.Magenta_f}Rendered     {bc.White_f}: {bc.OKGREEN}{len(done)}{bc.ENDC}")
+    if failed:
+        print(f"  {bc.BOLD + bc.Magenta_f}Failed       {bc.White_f}: {bc.BOLD + bc.Red_f}{len(failed)}{bc.ENDC}")
+    if skipped:
+        print(f"  {bc.BOLD + bc.Magenta_f}Skipped      {bc.White_f}: {bc.BOLD + bc.Red_f}{len(skipped)}"
+              f"{bc.Dark_Gray_f}  (not rendered: see reasons below){bc.ENDC}")
+    if interrupted:
+        print(f"  {bc.BOLD + bc.Magenta_f}Not finished {bc.White_f}: {bc.Yellow_f}{total - len(results)}"
+              f"{bc.Dark_Gray_f}  (interrupted){bc.ENDC}")
+    if failed or skipped:
+        print(sep)
+        for job, status, detail in failed + skipped:
+            print(f"  {bc.BOLD + bc.Red_f}{status:<8}{bc.ENDC} {bc.OKBLUE}{job.label}{bc.ENDC}")
+            print(f"           {bc.Dark_Gray_f}{detail}{bc.ENDC}")
+    print(sep)
+    print()
+
+
+def run_jobs(opts, jobs):
+    """
+    Render every job in turn; a failed or skipped job does not stop the batch.
+
+    :return: process exit code (0 all rendered, 1 any failure, 130 interrupted).
+    """
+    import time
+    bc = Bcolors()
+    total = len(jobs)
+    results = []
+    interrupted = False
+    started = time.monotonic()
+    try:
+        for i, job in enumerate(jobs, 1):
+            position = f"[{i}/{total}] " if total > 1 else ""
+            if job.error:
+                print(f"\n  {bc.BOLD + bc.Red_f}{position}Skipped {bc.OKBLUE}{job.label}"
+                      f"{bc.Red_f}: {job.error}{bc.ENDC}")
+                results.append((job, "SKIPPED", job.error))
+                continue
+            ok = render_one(opts, str(job.img_dir), str(job.output), position)
+            results.append((job, "DONE" if ok else "FAILED",
+                            str(job.output) if ok else "render failed (see above)"))
+    except KeyboardInterrupt:
+        interrupted = True
+        print(f"\n{bc.BOLD + bc.Yellow_f}Interrupted.{bc.ENDC}")
+    if total > 1 or interrupted:
+        print_batch_summary(results, total, time.monotonic() - started, interrupted)
+    if interrupted:
+        return 130
+    return 0 if all(status == "DONE" for _, status, _ in results) else 1
+
+
+def run_per_folder(opts, jobs):
+    """--calculate / --gen_filter_map for each folder; returns the exit code."""
+    bc = Bcolors()
+    failed = 0
+    for job in jobs:
+        if job.error:
+            print(f"{bc.BOLD + bc.Red_f}Invalid --img_path {bc.OKBLUE}{job.label}"
+                  f"{bc.Red_f}: {job.error}{bc.ENDC}")
+            failed += 1
+        elif opts.calculate:
+            calculate_report(opts, str(job.img_dir))
+        else:
+            generate_filter_map(str(job.img_dir), opts.fmap_threshold, opts.smooth, opts.sharpen)
+    return 1 if failed else 0
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    opts, jobs = cliOpts()
+    if opts.calculate or opts.gen_filter_map:
+        sys.exit(run_per_folder(opts, jobs))
+    sys.exit(run_jobs(opts, jobs))
