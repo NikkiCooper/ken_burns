@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
-# Bash Completion Script for ken_burns.py - v0.1
+# Bash Completion Script for ken_burns.py - v0.2
 # Source this file in your terminal for live testing:
 # $ source /path/to/ken_burns-bash-completion.sh
+
+# Typed word -> literal path prefix for compgen: "Hanna\ F" -> "Hanna F", drop an opening quote
+_ken_burns_dequote() {
+    local w=${1//\\ / }
+    w=${w#[\"\']}
+    printf '%s' "${w/#\~/$HOME}"
+}
 
 _ken_burns_complete() {
     local cur="${COMP_WORDS[COMP_CWORD]}"
     local prev="${COMP_WORDS[COMP_CWORD-1]}"
 
     # Argument groups
-    local file_opts="--img_path -o --output"
+    local file_opts="--img_path -o --output --auto_filename --suffix"
     local timing_opts="-d --duration -f --fps --trans_time"
     local kb_opts="--ken_burns -z --zoom_in"
     local trans_opts="--ftb --random --drift --rand_drift"
@@ -38,7 +45,8 @@ _ken_burns_complete() {
     # Handle single-argument flags (reset last_opt after 1 argument)
     if [[ -n "$last_opt" && "$opt_index" -lt $((COMP_CWORD - 1)) ]]; then
         case "$last_opt" in
-            # Add any multi-argument flags here if applicable (none in ken_burns by default)
+            --img_path)
+                ;;              # takes several folders: keep completing directories
             *)
                 last_opt=""
                 ;;
@@ -48,11 +56,21 @@ _ken_burns_complete() {
     # Match against the active option context
     case "$last_opt" in
         --img_path)
-            COMPREPLY=( $(compgen -d -- "$cur") )  # Source directory of images
+            # Image folders (one or more); names may contain spaces
+            local IFS=$'\n'
+            compopt -o filenames 2>/dev/null
+            COMPREPLY=( $(compgen -d -- "$(_ken_burns_dequote "$cur")") )
             return 0
             ;;
         -o|--output)
-            COMPREPLY=( $(compgen -f -- "$cur") )  # Full output video path
+            # Output video path, or a directory with --auto_filename
+            local IFS=$'\n'
+            compopt -o filenames 2>/dev/null
+            COMPREPLY=( $(compgen -f -- "$(_ken_burns_dequote "$cur")") )
+            return 0
+            ;;
+        --suffix)
+            COMPREPLY=( $(compgen -W "AI_Kenburns Kenburns" -- "$cur") )
             return 0
             ;;
         --smooth)
