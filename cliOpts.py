@@ -28,10 +28,10 @@ See Also
 argparse.ArgumentParser
     Standard library parser used to define command-line arguments.
 """
-import os
 import sys
 import argparse
 from Bcolors import Bcolors
+from imgbatch import plan_render, resolve_dirs
 from version import __version__
 
 def cliOpts():
@@ -46,11 +46,42 @@ def cliOpts():
     # -------------------------------------------------------------------------
     grp_io = parser.add_argument_group("File I/O")
     grp_io.add_argument("--img_path", action="store", type=str, dest="img_path", default=None,
-                        help=f"Source directory of images\n"
+                        nargs="+", metavar="PATH",
+                        help=f"Source folder(s) of images: paths or glob / numeric-range patterns\n"
+                             f"  {bc.BOLD+bc.Magenta_f}Supports: {bc.OKGREEN}*  ?  [abc]  [!abc]  {{N-M}}  {{N-}}{bc.ENDC}\n"
+                             f"    {bc.OKGREEN}{{N-M}}{bc.ENDC}  a whole number from N to M, e.g. "
+                             f"{bc.OKGREEN}'Bobbie-Slideshow-{{077-082}}*'{bc.ENDC}\n"
+                             f"    {bc.OKGREEN}{{N-}}{bc.ENDC}   from N to 999\n"
+                             f"  Wildcards apply to the folder name; without a directory the current\n"
+                             f"  directory is searched.  Quote patterns so the shell passes them unchanged\n"
+                             f"  More than one folder is a batch: requires --auto_filename\n"
                              f"{bc.BOLD+bc.Red_f}Required{bc.ENDC}")
     grp_io.add_argument("-o", "--output", action="store", type=str, dest="output", default=None,
-                        help=f"Full output path for the generated video  (directory + filename)\n"
+                        help=f"Output video: a full path including the filename, or an existing\n"
+                             f"  directory when --auto_filename is given\n"
                              f"  Example: /home/user/Videos/slideshow.mp4\n"
+                             f"  An existing video is never overwritten — the render fails instead\n"
+                             f"{bc.BOLD+bc.Red_f}Required  {bc.Dark_Gray_f}(not required for --calculate / --gen_filter_map){bc.ENDC}")
+    grp_io.add_argument("--auto_filename", action="store_true", dest="auto_filename", default=False,
+                        help=f"Derive each output filename from its --img_path folder name:\n"
+                             f"  {bc.OKGREEN}<model>-Slideshow-<set>[_SUFFIX]_Extracted{bc.ENDC}  →  "
+                             f"{bc.OKGREEN}<model>-Slideshow-<set>_<--suffix>.mp4{bc.ENDC}\n"
+                             f"  Folder names may end in {bc.OKGREEN}_Extracted{bc.ENDC} (extractStills.py) "
+                             f"or {bc.OKGREEN}_extracted_frames{bc.ENDC}\n"
+                             f"  --output must then be an existing directory\n"
+                             f"{bc.BOLD+bc.Magenta_f}Required for: {bc.OKBLUE}batch mode  "
+                             f"{bc.Dark_Gray_f}(more than one --img_path folder){bc.ENDC}")
+    grp_io.add_argument("--suffix", action="store", type=str, dest="suffix", default=None,
+                        metavar="SUFFIX",
+                        help=f"Suffix of the output video name, e.g. {bc.OKGREEN}AI_Kenburns{bc.ENDC}  "
+                             f"(leading '_' optional)\n"
+                             f"  Replaces the folder's SUFFIX, or is appended when it has none:\n"
+                             f"    {bc.OKGREEN}Bobbie-Slideshow-077_AI{bc.ENDC} + {bc.OKGREEN}AI_Kenburns{bc.ENDC}"
+                             f"  →  {bc.OKGREEN}Bobbie-Slideshow-077_AI_Kenburns.mp4{bc.ENDC}\n"
+                             f"  Not allowed: spaces; empty or {bc.OKGREEN}AI{bc.ENDC} "
+                             f"(those mark videos not made by ken_burns);\n"
+                             f"  the folder's own SUFFIX (the result would be the source video's name)\n"
+                             f"  With an explicit --output filename it is validated only\n"
                              f"{bc.BOLD+bc.Red_f}Required  {bc.Dark_Gray_f}(not required for --calculate / --gen_filter_map){bc.ENDC}")
 
     # -------------------------------------------------------------------------
@@ -165,7 +196,7 @@ def cliOpts():
                          choices=["auto", "yuv420p", "p010le", "yuv444p16le"],
                          help=f"Encoder input pixel format (converted from bgr24)\n"
                               f"  yuv444p16le : 10-bit 4:4:4, HEVC RExt → yuv444p10le stream  (default)\n"
-                              f"                Requires pro NVENC for encode (e.g. RTX A4500)\n"
+                              f"                Encode: 7th-gen NVENC+ (GTX 1660 / RTX 20 or newer)\n"
                               f"  p010le      : 10-bit 4:2:0, HEVC Main10\n"
                               f"  yuv420p     : 8-bit 4:2:0, max compatibility\n"
                               f"  auto        : yuv444p16le; falls back to yuv420p only with --h264\n"
@@ -244,17 +275,13 @@ def cliOpts():
         sys.exit(0)
 
     # ---- all remaining modes require --img_path ----
-    if options.img_path is None:
+    if not options.img_path:
         print(f"{bc.BOLD+bc.Red_f}--img_path is required.{bc.ENDC}")
         sys.exit(1)
-    tmp_img_path = os.path.expanduser(options.img_path)
-    if not os.path.isdir(tmp_img_path):
-        print(f"{bc.BOLD+bc.Red_f}Invalid --img_path: {bc.OKBLUE}{tmp_img_path}{bc.ENDC}")
-        sys.exit(1)
 
-    # ---- gen_filter_map / calculate: only need --img_path ----
+    # ---- gen_filter_map / calculate: only need --img_path (each folder in turn) ----
     if options.gen_filter_map or options.calculate:
-        return options, tmp_img_path, None
+        return options, resolve_dirs(options.img_path)
 
     # ---- mutual exclusion checks ----
     if options.ftb and options.random:
@@ -285,15 +312,10 @@ def cliOpts():
         print(f"{bc.BOLD+bc.Red_f}--drift must be in range 0.0–1.0 (got {options.drift:.4f}){bc.ENDC}")
         sys.exit(1)
 
-    # ---- render mode requires --output ----
-    if options.output is None:
-        print(f"{bc.BOLD+bc.Red_f}--output is required for rendering.{bc.ENDC}")
-        sys.exit(1)
-
-    tmp_output    = os.path.expanduser(options.output)
-    tmp_out_dir   = os.path.dirname(os.path.abspath(tmp_output))
-    if not os.path.isdir(tmp_out_dir):
-        print(f"{bc.BOLD+bc.Red_f}Output directory does not exist: {bc.OKBLUE}{tmp_out_dir}{bc.ENDC}")
+    # ---- render mode: --suffix, --output, and an output name per folder ----
+    plan = plan_render(options.img_path, options.output, options.auto_filename, options.suffix)
+    if plan.fatal:
+        print(f"{bc.BOLD+bc.Red_f}{plan.fatal}{bc.ENDC}")
         sys.exit(1)
 
     # ---- timing validation ----
@@ -306,4 +328,4 @@ def cliOpts():
               f"Reduce --trans_time or increase --duration.{bc.ENDC}")
         sys.exit(1)
 
-    return options, tmp_img_path, tmp_output
+    return options, plan.jobs
